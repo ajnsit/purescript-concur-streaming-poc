@@ -4,7 +4,7 @@ import Control.Applicative (class Applicative, pure, (*>))
 import Control.Apply (class Apply, apply)
 import Control.Bind (class Bind, bind, discard, join, (>>=))
 import Control.Category (identity)
-import Control.Monad (class Monad, unless, when)
+import Control.Monad (class Monad, ap, unless, when)
 import Control.Monad.Free (Free)
 import Control.Monad.Free as F
 import Control.Monad.Rec.Class (class MonadRec)
@@ -53,39 +53,9 @@ runCallback (Callback f) = f
 instance functorCallback :: Functor Callback where
   map f g = mkCallback \cb -> map (map f) <$> runCallback g (cb <<< f)
 
--- | The Applicative instance for callbacks behaves as follows -
--- | Every time either of cf or cv return values, the callback will be updated with (f v)
--- | This can happen multiple times
-instance applyCallback :: Apply Callback where
-  apply cf cv = mkCallback \cb -> do
-    fref <- Ref.new Nothing
-    vref <- Ref.new Nothing
-    cancelerF <- runCallback cf \f -> do
-      Ref.write (Just f) fref
-      mv <- Ref.read vref
-      case mv of
-        Just v -> cb (f v)
-        _ -> pure unit
-    cancelerV <- runCallback cv \v -> do
-      Ref.write (Just v) vref
-      mv <- Ref.read fref
-      case mv of
-        Just f -> cb (f v)
-        _ -> pure unit
-    pure do
-      cf' <- cancelerF
-      cv' <- cancelerV
-      pure (apply cf' cv')
-
 -- | A callback that will never be resolved
 never :: forall a. Callback a
 never = mkCallback \_cb -> pure (pure never)
-
--- | This is tricky. The current implementation can be surprising to the calling code
--- | as we immediately resolve the callback, even before the canceler is returned.
--- | Also note that when you cancel this callback, the continuation will be `never`
-instance applicativeCallback :: Applicative Callback where
-  pure a = mkCallback \cb -> cb a $> pure never
 
 -- NOTE: We currently have no monadic instance for callbacks
 -- Remember: The monadic instance *must* agree with the applicative instance
@@ -105,13 +75,10 @@ mkWidget :: forall v a. Callback' (Either v a) -> Widget v a
 mkWidget e = Widget (Callback e)
 
 instance applyWidget :: Apply (Widget v) where
-  apply wf wv = do
-    f <- wf
-    v <- wv
-    pure (f v)
+  apply = ap
 
 instance applicativeWidget :: Applicative (Widget v) where
-  pure a = Widget (pure (Right a))
+  pure a = mkWidget \cb -> cb (Right a) $> pure never
 
 instance bindWidget :: Bind (Widget v) where
   bind m f = mkWidget \cb -> do
@@ -134,6 +101,8 @@ instance bindWidget :: Bind (Widget v) where
 
     -- The returned canceler just reads the canceler ref and runs it
     pure (join (Ref.read cancelerRef))
+
+instance monadWidget :: Monad (Widget v)
 
 -- | ORRing two widgets
 orr :: forall v a. Monoid v => Widget v a -> Widget v a -> Widget v a
@@ -189,7 +158,7 @@ button s = mkWidget \cb -> do
 menu :: Wid Int
 menu = do
   let b i = button (show i) $> i
-  i <- foldl orr (b 0) (map b (Array.range 1 10))
+  i <- foldl orr (b 0) (map b (Array.range 1 4))
   ok <- orr
     do button ("Confirm you are picking " <> show i <> ", OK?") $> true
     do button "Cancel" $> false
