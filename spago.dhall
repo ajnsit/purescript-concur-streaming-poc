@@ -6,14 +6,12 @@ You can edit this file as you like.
 , dependencies =
   [ "console"
   , "effect"
-  , "free"
   , "node-readline"
   , "psci-support"
   , "refs"
   , "arrays"
-  , "bifunctors"
-  , "either"
   , "foldable-traversable"
+  , "foreign-object"
   , "identity"
   , "integers"
   , "maybe"
@@ -21,10 +19,8 @@ You can edit this file as you like.
   , "numbers"
   , "prelude"
   , "safe-coerce"
-  , "tailrec"
   , "transformers"
   , "tuples"
-  , "unsafe-coerce"
   ]
 , packages = ./packages.dhall
 , sources = [ "src/**/*.purs", "test/**/*.purs" ]

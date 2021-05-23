@@ -1,5 +1,5 @@
 {
-  "name": "simple",
+  "name": "my-project",
   "version": "1.0.0",
   "description": "",
   "main": "index.js",
@@ -10,6 +10,11 @@
   "license": "ISC",
   "dev-dependencies": {
     "purescript": "^0.14.0",
+    "spago": "^0.20.0"
+  },
+  "dependencies": {
+    "purescript": "^0.14.0",
+    "purescript-language-server": "^0.15.0",
     "spago": "^0.20.0"
   }
 }

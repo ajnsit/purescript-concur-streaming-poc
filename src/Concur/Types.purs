@@ -1,204 +1,261 @@
 module Concur.Types where
 
-import Control.Applicative (class Applicative, pure, (*>))
-import Control.Apply (class Apply, apply)
+import Control.Applicative (class Applicative, pure)
+import Control.Apply (class Apply)
 import Control.Bind (class Bind, bind, discard, join, (>>=))
-import Control.Category (identity)
-import Control.Monad (class Monad, ap, unless, when)
-import Control.Monad.Free (Free)
-import Control.Monad.Free as F
-import Control.Monad.Rec.Class (class MonadRec)
+import Control.Monad (class Monad, ap)
 import Control.MonadFix (mfix)
-import Data.Array ((!!))
+import Data.Array ((:))
 import Data.Array as Array
-import Data.Bifunctor (bimap, lmap)
-import Data.Boolean (otherwise)
 import Data.CommutativeRing ((+))
-import Data.Either (Either(..))
-import Data.Foldable (foldl)
-import Data.FoldableWithIndex (traverseWithIndex_)
-import Data.Function (const, (#), ($), (<<<))
-import Data.Functor (class Functor, map, ($>), (<$>))
-import Data.Int (round)
+import Data.Function (flip, (#), ($), (<<<))
+import Data.Functor (class Functor, map, void, ($>), (<$), (<$>))
 import Data.Maybe (Maybe(..), maybe)
-import Data.Monoid (class Monoid, mempty)
 import Data.Newtype (class Newtype)
-import Data.Newtype as N
-import Data.Number (isNaN)
-import Data.Semigroup (class Semigroup, append, (<>))
-import Data.Show (class Show, show)
-import Data.Traversable (traverse)
-import Data.TraversableWithIndex (traverseWithIndex)
+import Data.Semigroup ((<>))
+import Data.Show (show)
+import Data.Traversable (sequence, sequence_, traverse, traverse_)
+import Data.TraversableWithIndex (forWithIndex)
 import Data.Unit (Unit, unit)
 import Effect (Effect)
-import Effect.Class.Console as Console
 import Effect.Ref as Ref
-import Node.ReadLine as Readline
+import Foreign.Object as Object
 import Safe.Coerce (coerce)
-import Unsafe.Coerce (unsafeCoerce)
+
 
 -- | Callback -> Effect Canceler (returns the unused effect)
 -- | Canceling will *always* have some leftover effect, else it would have ended already
 -- | TODO: Have a way to check if the callback is finished (i.e. will never be called again)
 -- |       One option is to have a cb = (Either partResult a -> Effect Unit)
-newtype Callback a = Callback (Callback' a)
-type Callback' a = (a -> Effect Unit) -> Effect (Effect (Callback a))
+type Callback v a = (Result v a -> Effect Unit) -> Effect (WidgetHandle v a)
 
-mkCallback :: forall a. Callback' a -> Callback a
-mkCallback = Callback
+mapCallback :: forall v a b. (a -> b) -> Callback v a -> Callback v b
+mapCallback f g = \cb -> map f <$> g (cb <<< map f)
 
-runCallback :: forall a. Callback a -> Callback' a
-runCallback (Callback f) = f
+newtype WidgetHandle v a = WidgetHandle (Effect (Callback v a))
 
-instance functorCallback :: Functor Callback where
-  map f g = mkCallback \cb -> map (map f) <$> runCallback g (cb <<< f)
+derive instance newtypeWidgetHandle :: Newtype (WidgetHandle v a) _
+
+instance functorWidgetHandle :: Functor (WidgetHandle v) where
+  map f (WidgetHandle e) = WidgetHandle (map (mapCallback f) e)
+
+widgetHandleFromCanceler :: forall v a. Effect (Callback v a) -> WidgetHandle v a
+widgetHandleFromCanceler = WidgetHandle
+
+widgetHandleFromSimpleCanceler :: forall v a. Effect Unit -> WidgetHandle v a
+widgetHandleFromSimpleCanceler e = WidgetHandle (never <$ e)
 
 -- | A callback that will never be resolved
-never :: forall a. Callback a
-never = mkCallback \_cb -> pure (pure never)
+never :: forall v a. Callback v a
+never = \_cb -> pure (widgetHandleFromCanceler (pure never))
 
--- NOTE: We currently have no monadic instance for callbacks
--- Remember: The monadic instance *must* agree with the applicative instance
+-- An Array context with a hole
+type ZipList a = {left :: Array a, right :: Array a}
 
 -- A Widget is basically a callback that returns a view or a return value
-newtype Widget v a = Widget (Callback (Either v a))
-derive instance functorWidget :: Functor (Widget v)
-instance newtypeWidget :: Newtype (Widget v a) (Callback (Either v a))
+data Result v a = View v | Eff (Effect Unit) | Result {result :: a, remaining :: Unit -> ZipList (RemainingWidget v a)}
 
-unWid :: forall v a. Widget v a -> Callback (Either v a)
-unWid (Widget w) = w
+derive instance functorResult :: Functor (Result v)
+newtype Widget v a = Widget (Callback v a)
+instance functorWidget :: Functor (Widget v) where
+  map f (Widget w) = Widget (mapCallback f w)
+derive instance newtypeWidget :: Newtype (Widget v a) _
 
-runWidget :: forall v a. Widget v a -> Callback' (Either v a)
-runWidget (Widget (Callback e)) = e
+-----------------------
+-- LIFECYCLE METHODS --
 
-mkWidget :: forall v a. Callback' (Either v a) -> Widget v a
-mkWidget e = Widget (Callback e)
+-- | Cancel a callback, returns the remaining callback
+cancel' :: forall v a. WidgetHandle v a -> Effect (Callback v a)
+cancel' = coerce
+
+-- | Cancel a callback, returns the remaining widget
+cancel :: forall v a. WidgetHandle v a -> Effect (Widget v a)
+cancel = coerce
+
+-- | Cancel an array of callbacks, returns the array of remaining widgets
+cancelMany :: forall v a. Array (WidgetHandle v a) -> Effect (Array (Widget v a))
+cancelMany = sequence <<< coerce
+
+-----------------------
+
+mkResult :: forall v a. a -> Result v a
+mkResult result = Result {result, remaining: \_ -> {left: [], right: []}}
+
+unWid :: forall v a. Widget v a -> Callback v a
+unWid = coerce
+
+runWidget :: forall v a. Widget v a -> Callback v a
+runWidget = coerce
+
+-- | Create a widget from a callback
+mkWidget :: forall v a. Callback v a -> Widget v a
+mkWidget = Widget
 
 instance applyWidget :: Apply (Widget v) where
   apply = ap
 
 instance applicativeWidget :: Applicative (Widget v) where
-  pure a = mkWidget \cb -> cb (Right a) $> pure never
+  pure a = mkWidget \cb -> cb (mkResult a) $> widgetHandleFromCanceler (pure never)
 
 instance bindWidget :: Bind (Widget v) where
   bind m f = mkWidget \cb -> do
+    actionsRef <- Ref.new (Just [])
     -- CancelerRef starts out as a canceler for A, then becomes canceler for B
     cancelerRef <- mfix \cancelerRef -> do
-      cancelerA <- runWidget m \res -> do
-        case res of
-          Left v -> cb (Left v)
-          Right a -> do
-            -- After A has been resolved, the canceler just becomes a canceler for B
-            -- TODO: Should cancelerA also be cancelled here?
-            --   Depends on what the ideal API contract is. INVESTIGATE.
-            cancelerB <- runWidget (f a) cb
-            Ref.write cancelerB (cancelerRef unit)
+      widgetHandleA <- runWidget m \res -> do
+        let action = case res of
+              Eff e -> e
+              View v -> cb (View v)
+              Result a -> do
+                -- After A has been resolved, the canceler just becomes a canceler for B
+                -- TODO: Should widgetHandleA also be cancelled here?
+                --   Depends on what the ideal API contract is. INVESTIGATE.
+                -- NOTE: We can discard the remainder from A, since it's already moved on.
+                widgetHandleB <- runWidget (f a.result) cb
+                Ref.write (cancel' widgetHandleB) (cancelerRef unit)
+        Ref.read actionsRef >>= maybe action (flip Ref.write actionsRef <<< Just <<< (action : _))
 
       -- The initial canceler just cancels A, and then binds the remaining widget with B
       Ref.new do
-        c <- cancelerA
-        pure (unWid (bind (Widget c) f))
+        w <- cancel widgetHandleA
+        pure $ unWid $ bind w f
+
+    -- Now that we have the cancelers, we can run any pending effects
+    Ref.read actionsRef >>=
+      maybe (pure unit) \actions -> do
+        Ref.write Nothing actionsRef
+        sequence_ actions
 
     -- The returned canceler just reads the canceler ref and runs it
-    pure (join (Ref.read cancelerRef))
+    pure $ widgetHandleFromCanceler (join (Ref.read cancelerRef))
 
 instance monadWidget :: Monad (Widget v)
 
--- | ORRing two widgets
-orr :: forall v a. Monoid v => Widget v a -> Widget v a -> Widget v a
-orr wa wb = mkWidget \cb -> do
-  viewsRef <- Ref.new {viewA: mempty, viewB: mempty}
-  {cancelerA, cancelerB} <- mfix \ cancelers -> do
-    cancelerA <- runWidget wa \res -> do
-      case res of
-        Left va -> do
+type SiblingLifecycleHandler v a = ZipList (RemainingWidget v a) -> Effect (ZipList (RemainingWidget v a))
+
+-- | A stopped Widget which is not populated, or a handle to an already running and populated widget
+data RemainingWidget v a = RunningWidget (WidgetHandle v a) | StoppedWidget (Widget v a)
+derive instance functorRemainingWidget :: Functor (RemainingWidget v)
+
+cancelRemainingWidget :: forall v a. RemainingWidget v a -> Effect (Widget v a)
+cancelRemainingWidget = case _ of
+  StoppedWidget w -> pure w
+  RunningWidget c -> cancel c
+
+cancelManyRemainingWidget :: forall v a. Array (RemainingWidget v a) -> Effect (Array (Widget v a))
+cancelManyRemainingWidget arr = traverse cancelRemainingWidget arr
+
+-- Default behavior is to cancel all the siblingWids
+defaultSiblingLifecycleHandler :: forall v a. SiblingLifecycleHandler v a
+defaultSiblingLifecycleHandler siblingLifecycles = do
+  left <- map StoppedWidget <$> cancelManyRemainingWidget siblingLifecycles.left
+  right <- map StoppedWidget <$> cancelManyRemainingWidget siblingLifecycles.right
+  pure {left, right}
+
+-- | Orr multiple widgets together, canceling any sibling widgets when a widget returns
+cancelMOrr :: forall v a. (Object.Object v -> v) -> (v -> v -> Maybe v) -> Array (RemainingWidget v a) -> (Widget v a)
+cancelMOrr = mOrr defaultSiblingLifecycleHandler
+
+-- | Orr multiple widgets together
+mOrr :: forall v a. SiblingLifecycleHandler v a -> (Object.Object v -> v) -> (v -> v -> Maybe v) -> Array (RemainingWidget v a) -> Widget v a
+mOrr handleSiblingLifecycle mergeView stepView = go
+  where
+  go :: Array (RemainingWidget v a) -> (Widget v a)
+  go widgets = mkWidget \cb -> do
+    viewsRef <- Ref.new Object.empty
+
+    -- TODO: Need to protect these views from race conditions
+    let updateView label newView = do
           views <- Ref.read viewsRef
-          cb (Left (va <> views.viewB))
-          Ref.write {viewA: va, viewB: views.viewB} viewsRef
-        Right a -> do
-          cb (Right a)
-          restB <- (cancelers unit).cancelerB
-          pure unit
-    cancelerB <- runWidget wb \res -> do
-      case res of
-        Left vb -> do
-          views <- Ref.read viewsRef
-          cb (Left (views.viewA <> vb))
-          Ref.write {viewA: views.viewA, viewB: vb} viewsRef
-        Right b -> do
-          cb (Right b)
-          restA <- cancelerA
-          pure unit
-    pure {cancelerA, cancelerB}
-  pure do
-    restA <- cancelerA
-    restB <- cancelerB
-    pure (unWid (orr (Widget restA) (Widget restB)))
+          Object.lookup label views
+            # maybe (Just newView) (flip stepView newView)
+            # traverse \v' -> do
+                let views' = Object.insert label v' views
+                Ref.write views' viewsRef
+                pure views'
+
+    actionsRef <- Ref.new (Just [])
+    cancelers <- mfix \cancelersThunk ->
+      forWithIndex widgets \indexWidget -> case _ of
+        RunningWidget c -> pure (RunningWidget c)
+        StoppedWidget wid -> RunningWidget <$> runWidget wid \res -> do
+          let action = case res of
+                Eff e -> e
+                View v -> do
+                  mv' <- updateView (show indexWidget) v
+                  mv' # traverse_ (cb <<< View <<< mergeView)
+                Result a -> do
+                  -- TODO: Notice that this also calls the canceler for the finishing widget
+                  -- Not sure if that's the correct approach. Depends on the API contract.
+                  -- HACK: Use `pure` instead of `let` to ensure cancelers computation is not floated up out of the action
+                  cancelers <- pure (cancelersThunk unit)
+                  let leftCancelers = Array.slice 0 indexWidget cancelers
+                  let rightCancelers = Array.slice (indexWidget+1) (Array.length cancelers) cancelers
+                  siblingWids <- handleSiblingLifecycle { left: leftCancelers, right: rightCancelers }
+                  cb (Result { result: a.result
+                             , remaining: \_ ->
+                                 let rem = a.remaining unit
+                                 in { left: siblingWids.left <> rem.left, right: rem.right <> siblingWids.right }
+                             })
+          mactions <- Ref.read actionsRef
+          mactions # maybe action \actions -> case res of
+            -- Specifically for the view case, we only report the view after
+            -- the widget has finished initialising
+            View v -> void $ updateView (show indexWidget) v
+            _ -> Ref.write (Just (action : actions)) actionsRef
+
+    -- Now that we have the cancelers, we can run any pending actions
+    Ref.read actionsRef >>=
+      maybe (pure unit) \effects -> do
+        Ref.write Nothing actionsRef
+        sequence_ effects
+
+    -- And report the view
+    view <- Ref.read viewsRef
+    cb (View (mergeView view))
+
+    pure $ widgetHandleFromCanceler $ map (unWid <<< go) $ map StoppedWidget <$> cancelManyRemainingWidget cancelers
+
+    -- TODO: We eventually want this following formulation to work. This does compile, but doesn't cancel things which messes up the UI.
+    -- When canceling the top level ORR widget, we want to not have to immediately cancel all the ORR'd widgets, and still have the UI be consistent
+    -- pure $ widgetHandleFromCanceler $ pure $ unWid $ go cancelers
 
 
 
--- Simple menu views
--- An option has the option text, and a callback for when selected
-data Option = Option String (Effect Unit)
--- Simple menu view, is a collection of options
--- There is no user input apart from choosing one option
--- Arrays already have a monoid instance
-type View = Array Option
--- Widget that uses this view type
-type Wid a = Widget View a
+-- | Run an effect inside a widget
+effect :: forall v a. Effect a -> Widget v a
+effect e = mkWidget \cb -> do
+  e >>= (cb <<< mkResult)
+  pure $ widgetHandleFromCanceler $ pure never
 
--- Sample wid
-button :: String -> Wid Unit
-button s = mkWidget \cb -> do
-  let handler = cb (Right unit)
-  cb (Left [Option s handler])
-  pure (pure (unWid (button s)))
+-- A simple async effect, takes in a callback and returns a canceler
+type Async a = (a -> Effect Unit) -> Effect (Effect Unit)
 
--- Make a little menu UI
-menu :: Wid Int
-menu = do
-  let b i = button (show i) $> i
-  i <- foldl orr (b 0) (map b (Array.range 1 4))
-  ok <- orr
-    do button ("Confirm you are picking " <> show i <> ", OK?") $> true
-    do button "Cancel" $> false
-  if ok then pure i else menu
+-- | Run an async action inside a widget
+affect :: forall v a. Async a -> Widget v a
+affect callback = mkWidget \cb -> do
+  canceler <- callback (cb <<< mkResult)
+  pure (widgetHandleFromSimpleCanceler canceler)
 
--- A Widget driver
-runWid :: forall a. Show a => Wid a -> Effect Unit
-runWid w = do
-  interfaceRef <- Ref.new Nothing
-  _ <- runWidget w \res -> case res of
-    Left v -> do
-      prevInterface <- Ref.read interfaceRef
-      prevInterface # maybe (pure unit) Readline.close
-      interface <- handleOptions v
-      Ref.write (Just interface) interfaceRef
-    Right a -> Console.log ("YOU PICKED " <> show a)
-  pure unit
+-- | Make an object from an array. With element indices, converted to string, as the keys.
+-- mkObject :: forall a. Array a -> Object a
+-- mkObject = Object.fromFoldable <<< mapWithIndex (Tuple <<< show)
 
-handleOptions :: Array Option -> Effect Readline.Interface
-handleOptions opts = do
-  Console.log "Options"
-  Console.log "-------"
-  opts # traverseWithIndex_ \i (Option s e) -> Console.log (show i <> ") " <> s)
+-- A common pattern
+-- ORR a bunch of widgets, after one returns process it, and then continue with the modified widget
+-- morr :: forall v a r. Monoid v => (a -> Widget v (Either a r)) -> Array a -> Widget v r
+-- morr f arr = mkWidget \cb -> do
+--   canceler <- runWidget (multiorr (map f arr)) \res -> do
+--     case res of
+--       View v -> cb (View v)
+--       Result r -> do
+--         let w' = f r.result
+--         let rem = r.remaining
+--         let marr = Array.updateAt
 
-  interface <- Readline.createConsoleInterface Readline.noCompletion
-  interface # Readline.question "Pick your choice> " \s -> do
-    let mcallback = do
-          i <- parseInt s
-          (Option _ e) <- opts !! i
-          pure e
-    -- Close readline interface before proceeding with the callback
-    Readline.close interface
-    maybe (Console.log "INVALID INPUT") identity mcallback
-  pure interface
-
--- Utility
-foreign import unsafeParseInt :: String -> Number
-parseInt :: String -> Maybe Int
-parseInt s =
-  let x = unsafeParseInt s
-  in if isNaN x
-     then Nothing
-     else Just (round x)
+-- TODO
+-- Add nesting widgets
+  -- Also then use ZipTree instead of ZipList.
+-- Static views
+-- Effects
+-- Async
