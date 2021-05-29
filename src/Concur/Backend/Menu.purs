@@ -1,15 +1,14 @@
 module Concur.Backend.Menu where
 
-import Concur.Types (RemainingWidget(..), Result(..), Widget, affect, cancelMOrr, effect, mkWidget, runWidget, unWid, widgetHandleFromCanceler)
+import Concur.Types (RemainingWidget(..), Result(..), Widget, affect, cancelMOrr, mkWidget, runWidget, unWid, widgetHandleFromCanceler)
 import Control.Applicative (pure)
 import Control.Bind (bind, discard)
 import Control.Category (identity)
 import Data.Array ((!!))
-import Data.Array as Array
 import Data.Foldable (fold)
 import Data.FoldableWithIndex (traverseWithIndex_)
-import Data.Function (const, (#), ($), (<<<))
-import Data.Functor (map, ($>))
+import Data.Function (const, (#), (<<<))
+import Data.Functor (map)
 import Data.Int (round)
 import Data.Maybe (Maybe(..), maybe)
 import Data.Monoid (class Monoid)
@@ -42,35 +41,6 @@ button s = mkWidget \cb -> do
 -- No VDOM,
 orr :: forall v a. Monoid v => Array (Widget v a) -> Widget v a
 orr = cancelMOrr fold (const Just) <<< map StoppedWidget
-
--- Make a little menu UI
-menu :: Wid Int
-menu = do
-  let b i = button (show i) $> i
-  i <- orr (map b (Array.range 0 5))
-  effect $ Console.log $ "PICKED: " <> show i
-  effect $ Console.log "THINKING...."
-  delay 2000
-  effect $ Console.log "DONE THINKING.... FORCING 3 INSTEAD..."
-  i <- pure 3
-  mOk <- orr
-    [ orr
-      [ do button ("Confirm you are picking " <> show i <> ", OK?") $> Just true
-      , do button "Cancel" $> Just false
-      , delay 5000 $> Nothing
-      ]
-    , orr
-      [ do button "Cancel 2" $> Just false
-      ]
-    ]
-  case mOk of
-    Nothing -> do
-      effect $ Console.log "You took too long. Going back."
-      menu
-    Just ok -> do
-      if ok then pure i else do
-        effect $ Console.log "CANCELLED. RESTARTING."
-        menu
 
 foreign import delay_ :: Int -> Effect Unit -> Effect (Effect Unit)
 
