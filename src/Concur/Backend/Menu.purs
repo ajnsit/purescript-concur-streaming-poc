@@ -1,6 +1,6 @@
 module Concur.Backend.Menu where
 
-import Concur.Types (RemainingWidget(..), Result(..), Widget, affect, callbackLifecycleFromCanceler, cancelMOrr, effect, mkWidget, runWidget, unWid)
+import Concur.Types (RemainingWidget(..), Result(..), Widget, affect, cancelMOrr, effect, mkWidget, runWidget, unWid, widgetHandleFromCanceler)
 import Control.Applicative (pure)
 import Control.Bind (bind, discard)
 import Control.Category (identity)
@@ -37,7 +37,7 @@ button :: String -> Wid Unit
 button s = mkWidget \cb -> do
   let handler = cb (Result {result: unit, remaining: \_ -> {left: [], right: []}})
   cb (View [Option s handler])
-  pure (callbackLifecycleFromCanceler (pure (unWid (button s))))
+  pure (widgetHandleFromCanceler (pure (unWid (button s))))
 
 -- No VDOM,
 orr :: forall v a. Monoid v => Array (Widget v a) -> Widget v a
